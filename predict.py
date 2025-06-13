@@ -1,409 +1,187 @@
-
-# WORKING CODE BEST VERSION 
-
 import cv2
+import time
+import pandas as pd
+import atexit
+import os
+from datetime import datetime
 from ultralytics import YOLO
 import easyocr
 
-# Initialize the YOLO model
-model = YOLO(r"C:\Users\clint\OneDrive\coding\ComputerVision\car_detection_model.pt")  # Replace with your trained model file
+# Define model paths
+CAR_MODEL_PATH = r"C:\Users\clint\OneDrive\coding\ComputerVision\car_detection_model.pt"
+PLATE_MODEL_PATH = r"C:\Users\clint\OneDrive\coding\ComputerVision\license_plate_detection.pt"
+
+# Initialize the YOLO models
+car_model = YOLO(CAR_MODEL_PATH)
+plate_model = YOLO(PLATE_MODEL_PATH)
 
 # Initialize the OCR reader
 reader = easyocr.Reader(['en'], gpu=True)
 
+# Define folder to save car images
+SAVE_FOLDER = r"C:\Users\clint\OneDrive\coding\ComputerVision\car_detected"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# Initialize DataFrame for saving results
+excel_path = "license_plate_log.xlsx"
+df_columns = ["car_id", "serial_number", "confidence_score", "license_number_plate", "plate_score", "date", "time"]
+serial_number = 1  # Increment with every detection
+
+# Try to load existing data to maintain car ID continuity
+try:
+    existing_df = pd.read_excel(excel_path)
+    if not existing_df.empty:
+        car_id = existing_df["car_id"].max() + 1  # Increment car_id for the new batch
+    else:
+        car_id = 1
+except FileNotFoundError:
+    car_id = 1  # Initialize if no previous data exists
+
+# Confidence threshold
+CONF_THRESHOLD = 0.7  # Only process detections above 70% confidence
+
+# Initialize FPS tracking
+previous_time = time.time()
+frame_count = 0
+fps = 0
+
+def save_log(df):
+    """Ensure the log is saved before exit, appending instead of overwriting."""
+    if not df.empty:
+        try:
+            existing_df = pd.read_excel(excel_path)
+        except FileNotFoundError:
+            existing_df = pd.DataFrame(columns=df_columns)
+
+        df_final = pd.concat([existing_df, df], ignore_index=True)
+        df_final.to_excel(excel_path, index=False)
+        print("License plate log updated successfully.")
+
+def filter_highest_plate_score():
+    """Filter rows, keeping only the highest plate score row from the highest car_id."""
+    try:
+        df = pd.read_excel(excel_path)
+
+        if df.empty:
+            print("No data found in the Excel file.")
+            return
+
+        # Find the highest car_id value
+        highest_car_id = df["car_id"].max()
+
+        # Separate untouched data + rows to filter
+        df_untouched = df[df["car_id"] != highest_car_id]  # Keep all other car_id values
+        df_filtered = df[df["car_id"] == highest_car_id]  # Filter only highest car_id rows
+
+        # Find the row with the highest plate score among the filtered rows
+        highest_score_row = df_filtered.loc[df_filtered["plate_score"].idxmax()]
+
+        # Combine untouched data with the highest-scoring row for highest car_id
+        df_final = pd.concat([df_untouched, pd.DataFrame([highest_score_row])], ignore_index=True)
+
+        # Save back to Excel
+        df_final.to_excel(excel_path, index=False)
+        print(f"Filtered successfully! Kept all other car IDs. Only the highest plate score row for car_id {highest_car_id} remains.")
+    except FileNotFoundError:
+        print("Excel file not found. Skipping filtering.")
+
 def ocr_image(img, coordinates):
     """Extracts text from detected license plates using EasyOCR."""
-    x, y, w, h = map(int, coordinates)
-    cropped_img = img[y:h, x:w]
-    
+    x1, y1, x2, y2 = map(int, coordinates)
+    cropped_img = img[y1:y2, x1:x2]
+
     gray = cv2.cvtColor(cropped_img, cv2.COLOR_RGB2GRAY)
     result = reader.readtext(gray)
-    
-    text = ""
-    for res in result:
-        if len(result) == 1:
-            text = res[1]
-        elif len(res[1]) > 6 and res[2] > 0.2:
-            text = res[1]
 
-    return text if text else "Plate Not Detected"
+    text, plate_score = "Plate Not Detected", 0.0
+    for res in result:
+        if len(res[1]) > 6 and res[2] > 0.2:  # Filter based on confidence
+            text, plate_score = res[1], res[2]
+
+    return text, plate_score
 
 # Open webcam
-cap = cv2.VideoCapture(0)  # Use 0 for default webcam, or change index for an external camera
-#cap = cv2.VideoCapture("http://192.168.178.65:4747/video")
+cap = cv2.VideoCapture(0)
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+df = pd.DataFrame(columns=df_columns)  # Store new entries
 
-    # Run YOLOv8 inference on frame
-    results = model.predict(frame)
+try:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    for result in results:
-        boxes = result.boxes.xyxy.cpu().numpy()
+        # Update FPS calculation
+        frame_count += 1
+        if frame_count % 10 == 0:
+            current_time = time.time()
+            fps = 10 / (current_time - previous_time)
+            previous_time = current_time
 
-        for box in boxes:
-            x1, y1, x2, y2 = map(int, box)
+        # Run car detection
+        car_results = car_model.predict(frame)
+        detected_car = False
 
-            # Extract and process detected region
-            cropped = frame[y1:y2, x1:x2]
-            text = ocr_image(frame, box)
+        for result in car_results:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            confs = result.boxes.conf.cpu().numpy()
 
-            # Draw bounding box and label
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = map(int, box)
+                conf_score = confs[i]
 
-    # Display the live detection feed
-    cv2.imshow("Live ANPR", frame)
+                if conf_score >= CONF_THRESHOLD:
+                    detected_car = True
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    cv2.putText(frame, f"Car ({conf_score:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-    # Press 'q' to exit
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+                    # Save detected car image
+                    img_filename = os.path.join(SAVE_FOLDER, f"car_detected_{serial_number:03d}.png")
+                    cv2.imwrite(img_filename, frame[y1:y2, x1:x2])
 
-# Release the webcam and close all OpenCV windows
-cap.release()
-cv2.destroyAllWindows()
+                    # Run license plate detection
+                    plate_results = plate_model.predict(frame)
+                    detected_plate = False
 
+                    for plate_result in plate_results:
+                        plate_boxes = plate_result.boxes.xyxy.cpu().numpy()
+                        plate_confs = plate_result.boxes.conf.cpu().numpy()
 
+                        for j, plate_box in enumerate(plate_boxes):
+                            px1, py1, px2, py2 = map(int, plate_box)
+                            plate_conf_score = plate_confs[j]
 
+                            if plate_conf_score >= CONF_THRESHOLD:
+                                detected_plate = True
+                                license_text, plate_score = ocr_image(frame, plate_box)
 
+                                # Draw bounding box
+                                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                                cv2.putText(frame, f"{license_text} ({plate_score:.2f})", (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
+                                # Save results to DataFrame
+                                df.loc[len(df)] = [car_id, serial_number, conf_score, license_text, plate_score, datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%H:%M:%S")]
 
+                    serial_number += 1
 
+        # Display FPS on the frame
+        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
+        # Display live detection feed
+        cv2.imshow("Live ANPR", frame)
 
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
+except KeyboardInterrupt:
+    print("Process interrupted. Saving detected data...")
+    save_log(df)
 
-
-
-# import cv2
-# from ultralytics import YOLO
-# import easyocr
-# import threading
-
-# # Initialize YOLO model
-# model = YOLO(r"C:\Users\clint\Downloads\Advanced-Automatic-Number-Plate-Recognition-System-ANPR--main\Advanced-Automatic-Number-Plate-Recognition-System-ANPR--main\bestn.pt")
-
-# # Initialize OCR reader
-# reader = easyocr.Reader(['en'], gpu=True)
-
-# def ocr_image(img, coordinates):
-#     """Extracts text from detected license plates using EasyOCR."""
-#     x, y, w, h = map(int, coordinates)
-#     cropped_img = img[y:h, x:w]
+finally:
+    save_log(df)
     
-#     gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
-#     result = reader.readtext(gray)
-
-#     text = ""
-#     for res in result:
-#         if len(res[1]) > 6 and res[2] > 0.4:  # Adjusted confidence threshold
-#             text = res[1]
-
-#     return text if text else "Plate Not Detected"
-
-# def process_frame(frame):
-#     """Runs YOLO detection and OCR on the frame."""
-#     results = model.predict(frame, conf=0.3)  # Lower confidence threshold speeds up detection
-
-#     for result in results:
-#         boxes = result.boxes.xyxy.cpu().numpy()
-
-#         for box in boxes:
-#             x1, y1, x2, y2 = map(int, box)
-
-#             # Run OCR in a separate thread for better speed
-#             threading.Thread(target=ocr_image, args=(frame, box)).start()
-
-#             # Draw bounding box and temporary text placeholder
-#             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-#             cv2.putText(frame, "Detecting...", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-#     return frame
-
-# # Open video stream (Change between webcam and DroidCam)
-# use_webcam = False  # Set True for webcam, False for DroidCam
-# cap = cv2.VideoCapture(0) 
-# #if use_webcam else cv2.VideoCapture("http://192.168.178.65:4747/video")
-
-# cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)  # Reduce buffering for lower delay
-# cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS to improve real-time speed
-
-# frame_skip = 3  # Skip every 3rd frame to optimize speed
-# frame_count = 0
-
-# while cap.isOpened():
-#     frame_count += 1
-#     ret, frame = cap.read()
-#     if not ret:
-#         break
-
-#     # Skip frames to reduce processing delay
-#     if frame_count % frame_skip != 0:
-#         continue
-
-#     # Reduce frame resolution before detection
-#     frame = cv2.resize(frame, (480, 320))  
-
-#     # Process frame in parallel thread
-#     thread = threading.Thread(target=process_frame, args=(frame,))
-#     thread.start()
-#     thread.join()
-
-#     # Display the live detection feed
-#     cv2.imshow("Live ANPR", frame)
-
-#     # Press 'q' to exit
-#     if cv2.waitKey(1) & 0xFF == ord('q'):
-#         break
-
-# # Cleanup
-# cap.release()
-# cv2.destroyAllWindows()
-
-
-
-
-
-
-
-
-
-
-
-
-# # WORKING CODE BEST CVERSION 
-
-# import cv2
-# from ultralytics import YOLO
-# import easyocr
-
-# # Initialize the YOLO model
-# model = YOLO(r"C:\Users\clint\Downloads\Advanced-Automatic-Number-Plate-Recognition-System-ANPR--main\Advanced-Automatic-Number-Plate-Recognition-System-ANPR--main\bestn.pt")  # Replace with your trained model file
-
-# # Initialize the OCR reader
-# reader = easyocr.Reader(['en'], gpu=True)
-
-# def ocr_image(img, coordinates):
-#     """Extracts text from detected license plates using EasyOCR."""
-#     x, y, w, h = map(int, coordinates)
-#     cropped_img = img[y:h, x:w]
-    
-#     gray = cv2.cvtColor(cropped_img, cv2.COLOR_RGB2GRAY)
-#     result = reader.readtext(gray)
-    
-#     text = ""
-#     for res in result:
-#         if len(result) == 1:
-#             text = res[1]
-#         elif len(res[1]) > 6 and res[2] > 0.2:
-#             text = res[1]
-
-#     return text if text else "Plate Not Detected"
-
-# # Open webcam
-# cap = cv2.VideoCapture(0)  # Use 0 for default webcam, or change index for an external camera
-# #cap = cv2.VideoCapture("http://192.168.178.65:4747/video")
-
-# while cap.isOpened():
-#     ret, frame = cap.read()
-#     if not ret:
-#         break
-
-#     # Run YOLOv8 inference on frame
-#     results = model.predict(frame)
-
-#     for result in results:
-#         boxes = result.boxes.xyxy.cpu().numpy()
-
-#         for box in boxes:
-#             x1, y1, x2, y2 = map(int, box)
-
-#             # Extract and process detected region
-#             cropped = frame[y1:y2, x1:x2]
-#             text = ocr_image(frame, box)
-
-#             # Draw bounding box and label
-#             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-#             cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-#     # Display the live detection feed
-#     cv2.imshow("Live ANPR", frame)
-
-#     # Press 'q' to exit
-#     if cv2.waitKey(1) & 0xFF == ord('q'):
-#         break
-
-# # Release the webcam and close all OpenCV windows
-# cap.release()
-# cv2.destroyAllWindows()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import hydra
-# import torch
-# import cv2
-# # from ultralytics.yolo.engine.predictor import BasePredictor
-# from ultralytics import YOLO
-
-# from ultralytics.yolo.engine.predictor import BasePredictor
-
-# from ultralytics.yolo.utils import DEFAULT_CONFIG, ROOT, ops
-# from ultralytics.yolo.utils.checks import check_imgsz
-# from ultralytics.yolo.utils.plotting import Annotator, colors, save_one_box
-# import easyocr
-# #import pytesseract
-
-# #TESSDATA_PREFIX = 'C:/Program Files (x86)/Tesseract-OCR/tessdata'
-# #pytesseract.pytesseract.tesseract_cmd = 'C:/Program Files (x86)/Tesseract-OCR/tesseract'
-# #flg=False
-# #reader = easyocr.Reader(['en'],gpu=True)
-# #reader = easyocr.Reader(['en', 'hi', 'mr'], gpu=True)
-# def ocr_image(img,coordinates):
-#     x,y,w, h = int(coordinates[0]), int(coordinates[1]), int(coordinates[2]),int(coordinates[3])
-#     img = img[y:h,x:w]
-
-#     #print('In the OCR_Image function')
-#     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-#     result = reader.readtext(gray)
-#     text = ""
-
-#     for res in result:
-#         if len(result) == 1:
-#             text = res[1]
-#         if len(result) >1 and len(res[1])>6 and res[2]> 0.2:
-#             text = res[1]
-    
-#     return str(text)
-
-# reader = easyocr.Reader(['en'],gpu=True)
-# def tesseract_recognition(img,coordinates):
-    
-    
-#     x,y,w,h = int(coordinates[0]), int(coordinates[1]), int(coordinates[2]),int(coordinates[3])
-#     img = img[y:h,x:w]
-#     #text_data = pytesseract.image_to_string(img, lang='eng')
-#     #print(text_data)
-#     print('In the Tessareract Recognition')
-#     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-#     result = reader.readtext(gray)
-#     text=""
-
-#     for res in result:
-#         if len(result) == 1:
-#             text = res[1]
-#         if len(result) >1 and len(res[1])>6 and res[2]> 0.2:
-#             text = res[1]
-    
-#     return str(text)
-#     #return text_data
-
-
-# class DetectionPredictor(BasePredictor):
-#     count=0
-#     def get_annotator(self, img):
-#         return Annotator(img, line_width=self.args.line_thickness, example=str(self.model.names))
-
-#     def preprocess(self, img):
-#         img = torch.from_numpy(img).to(self.model.device)
-#         img = img.half() if self.model.fp16 else img.float()
-#         img /= 255
-#         return img
-
-#     def postprocess(self, preds, img, orig_img):
-#         preds = ops.non_max_suppression(preds,self.args.conf,self.args.iou,agnostic=self.args.agnostic_nms,max_det=self.args.max_det)
-
-#         for i, pred in enumerate(preds):
-#             shape = orig_img[i].shape if self.webcam else orig_img.shape
-#             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], shape).round()
-
-#         return preds
-
-#     def write_results(self, idx, preds, batch):
-#         p, im, im0 = batch
-#         log_string = ""
-#         if len(im.shape) == 3:
-#             im = im[None]
-#         self.seen += 1
-#         im0 = im0.copy()
-#         if self.webcam:
-#             log_string += f'{idx}: '
-#             frame = self.dataset.count
-#         else:
-#             frame = getattr(self.dataset, 'frame', 0)
-
-#         self.data_path = p
-#         self.txt_path = str(self.save_dir / 'labels' / p.stem) + ('' if self.dataset.mode == 'image' else f'_{frame}')
-#         log_string += '%gx%g ' % im.shape[2:]
-#         self.annotator = self.get_annotator(im0)
-
-#         det = preds[idx]
-#         self.all_outputs.append(det)
-#         if len(det) == 0:
-#             return log_string
-#         for c in det[:, 5].unique():
-#             n = (det[:, 5] == c).sum()
-#             log_string += f"{n} {self.model.names[int(c)]}{'s' * (n > 1)}, "
- 
-#         gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
-#         for *xyxy, conf, cls in reversed(det):
-#             if self.args.save_txt: 
-#                 xywh = (ops.xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
-#                 line = (cls, *xywh, conf) if self.args.save_conf else (cls, *xywh) 
-#                 with open(f'{self.txt_path}.txt', 'a') as f:
-#                     f.write(('%g ' * len(line)).rstrip() % line + '\n')
-
-#             if self.args.save or self.args.save_crop or self.args.show:  # Add bbox to image
-#                 c = int(cls)  # integer class
-#                 #label = None if self.args.hide_labels else (
-#                     #self.model.names[c] if self.args.hide_conf else f'{self.model.names[c]} {conf:.2f}')
-#                 label = 'Number Plate'
-#                 text_ocr = ocr_image(im0,xyxy)
-#                 label = text_ocr
-#                 #label = tesseract_recognition(im0,xyxy)
-#                 self.annotator.box_label(xyxy, label, color=colors(c, True))
-
-#             #if self.args.save_crop:
-#             imc = im0.copy()
-#             save_path = self.save_dir / 'crops' / self.model.model.names[c] / f'{self.data_path.stem}.jpg'
-#             save_one_box(xyxy, imc, file=save_path, BGR=True)
-
-#             #Convert cropped image to grayscale
-#             #cropped_img = cv2.imread(str(save_path))
-#             #gray_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
-
-#             #Save grayscale image
-#             #gray_save_path = str(save_path).replace('.jpg', '_gray.jpg')
-#             #cv2.imwrite(gray_save_path, gray_img)
-#             #cv2.imwrite(str(save_path), gray_img)
-#         return log_string
-
-
-# @hydra.main(version_base=None, config_path=str(DEFAULT_CONFIG.parent), config_name=DEFAULT_CONFIG.name)
-# def predict(cfg):
-#     cfg.model = cfg.model or "best.pt"
-#     cfg.imgsz = check_imgsz(cfg.imgsz, min_dim=2)
-#     cfg.source = cfg.source if cfg.source is not None else ROOT / "assets"
-    
-#     if not hasattr(cfg, 'show'):
-#         cfg.show = True
-
-#     cfg.show = True
-#     predictor = DetectionPredictor(cfg)
-#     print(cfg.source)
-#     predictor()
-
-# if __name__ == "__main__":
-#     predict()
+    # Uncomment to enable filtering highest plate score for the highest car ID
+    filter_highest_plate_score()
+
+    cap.release()
+    cv2.destroyAllWindows()
