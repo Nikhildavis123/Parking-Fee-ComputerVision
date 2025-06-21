@@ -1,109 +1,89 @@
 import cv2
 import time
 import pandas as pd
-import atexit
 import os
+import re
+import numpy as np
 from datetime import datetime
 from ultralytics import YOLO
 import easyocr
 
-# Define model paths
+# ==================== Model paths ====================
 CAR_MODEL_PATH = r"C:\Users\clint\OneDrive\coding\ComputerVision\car_detection_model.pt"
 PLATE_MODEL_PATH = r"C:\Users\clint\OneDrive\coding\ComputerVision\license_plate_detection.pt"
 
-# Initialize the YOLO models
 car_model = YOLO(CAR_MODEL_PATH)
 plate_model = YOLO(PLATE_MODEL_PATH)
-
-# Initialize the OCR reader
 reader = easyocr.Reader(['en'], gpu=True)
 
-# Define folder to save car images
-SAVE_FOLDER = r"C:\Users\clint\OneDrive\coding\ComputerVision\car_detected"
-os.makedirs(SAVE_FOLDER, exist_ok=True)
-
-# Initialize DataFrame for saving results
+# ==================== File and format setup ====================
 excel_path = "license_plate_log.xlsx"
-df_columns = ["car_id", "serial_number", "confidence_score", "license_number_plate", "plate_score", "date", "time"]
-serial_number = 1  # Increment with every detection
+df_columns = ["plate_number", "in_time", "out_time", "plate_score", "duration", "parking_fee"]
+if not os.path.exists(excel_path):
+    pd.DataFrame(columns=df_columns).to_excel(excel_path, index=False)
+log_df = pd.read_excel(excel_path)
 
-# Try to load existing data to maintain car ID continuity
-try:
-    existing_df = pd.read_excel(excel_path)
-    if not existing_df.empty:
-        car_id = existing_df["car_id"].max() + 1  # Increment car_id for the new batch
-    else:
-        car_id = 1
-except FileNotFoundError:
-    car_id = 1  # Initialize if no previous data exists
+# ==================== Preprocessing folder setup ====================
+BASE_PREPROCESS_DIR = "preprocessed"
+STAGES = ["grayscale", "clahe", "bilateral", "gaussian", "sharpen"]
+for stage in STAGES:
+    os.makedirs(os.path.join(BASE_PREPROCESS_DIR, stage), exist_ok=True)
 
-# Confidence threshold
-CONF_THRESHOLD = 0.7  # Only process detections above 70% confidence
+# ==================== Config ====================
+CONF_THRESHOLD = 0.5
+PLATE_THRESHOLD = 0.3
+COOLDOWN_SECONDS = 5
+PARKING_RATE_PER_SECOND = 0.10  # €0.10 per second
+PLATE_FORMAT_REGEX = r"^[A-Z]{3}[0-9]{2}[A-Z]{1}[0-9]{4}$"
 
-# Initialize FPS tracking
-previous_time = time.time()
-frame_count = 0
-fps = 0
+# ==================== Helpers ====================
+def normalize_plate(text):
+    return re.sub(r'[^A-Z0-9]', '', text.upper())
 
-def save_log(df):
-    """Ensure the log is saved before exit, appending instead of overwriting."""
-    if not df.empty:
-        try:
-            existing_df = pd.read_excel(excel_path)
-        except FileNotFoundError:
-            existing_df = pd.DataFrame(columns=df_columns)
+def validate_plate_format(plate):
+    return re.fullmatch(PLATE_FORMAT_REGEX, plate) is not None
 
-        df_final = pd.concat([existing_df, df], ignore_index=True)
-        df_final.to_excel(excel_path, index=False)
-        print("License plate log updated successfully.")
+def preprocess_for_easyocr(plate_img, plate_id):
+    # Resize small plates
+    h, w = plate_img.shape[:2]
+    TARGET_WIDTH = 300
+    if w < TARGET_WIDTH:
+        scale_factor = TARGET_WIDTH / w
+        plate_img = cv2.resize(plate_img, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
 
-def filter_highest_plate_score():
-    """Filter rows, keeping only the highest plate score row from the highest car_id."""
-    try:
-        df = pd.read_excel(excel_path)
+    # 1. Grayscale
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    cv2.imwrite(os.path.join(BASE_PREPROCESS_DIR, "grayscale", f"{plate_id}.png"), gray)
 
-        if df.empty:
-            print("No data found in the Excel file.")
-            return
+    # 2. CLAHE for contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast = clahe.apply(gray)
+    cv2.imwrite(os.path.join(BASE_PREPROCESS_DIR, "clahe", f"{plate_id}.png"), contrast)
 
-        # Find the highest car_id value
-        highest_car_id = df["car_id"].max()
+    # 3. Bilateral filter (denoise)
+    bilateral = cv2.bilateralFilter(contrast, 11, 17, 17)
+    cv2.imwrite(os.path.join(BASE_PREPROCESS_DIR, "bilateral", f"{plate_id}.png"), bilateral)
 
-        # Separate untouched data + rows to filter
-        df_untouched = df[df["car_id"] != highest_car_id]  # Keep all other car_id values
-        df_filtered = df[df["car_id"] == highest_car_id]  # Filter only highest car_id rows
+    # 4. Gaussian blur
+    gaussian = cv2.GaussianBlur(bilateral, (5, 5), 0)
+    cv2.imwrite(os.path.join(BASE_PREPROCESS_DIR, "gaussian", f"{plate_id}.png"), gaussian)
 
-        # Find the row with the highest plate score among the filtered rows
-        highest_score_row = df_filtered.loc[df_filtered["plate_score"].idxmax()]
+    # 5. Sharpening
+    sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(gaussian, -1, sharpen_kernel)
+    cv2.imwrite(os.path.join(BASE_PREPROCESS_DIR, "sharpen", f"{plate_id}.png"), sharpened)
 
-        # Combine untouched data with the highest-scoring row for highest car_id
-        df_final = pd.concat([df_untouched, pd.DataFrame([highest_score_row])], ignore_index=True)
+    return sharpened
 
-        # Save back to Excel
-        df_final.to_excel(excel_path, index=False)
-        print(f"Filtered successfully! Kept all other car IDs. Only the highest plate score row for car_id {highest_car_id} remains.")
-    except FileNotFoundError:
-        print("Excel file not found. Skipping filtering.")
+# ==================== Track current session ====================
+current_session = {
+    "start_time": None,
+    "last_seen": None,
+    "plates": []
+}
 
-def ocr_image(img, coordinates):
-    """Extracts text from detected license plates using EasyOCR."""
-    x1, y1, x2, y2 = map(int, coordinates)
-    cropped_img = img[y1:y2, x1:x2]
-
-    gray = cv2.cvtColor(cropped_img, cv2.COLOR_RGB2GRAY)
-    result = reader.readtext(gray)
-
-    text, plate_score = "Plate Not Detected", 0.0
-    for res in result:
-        if len(res[1]) > 6 and res[2] > 0.2:  # Filter based on confidence
-            text, plate_score = res[1], res[2]
-
-    return text, plate_score
-
-# Open webcam
+# ==================== Main Loop ====================
 cap = cv2.VideoCapture(0)
-
-df = pd.DataFrame(columns=df_columns)  # Store new entries
 
 try:
     while cap.isOpened():
@@ -111,77 +91,92 @@ try:
         if not ret:
             break
 
-        # Update FPS calculation
-        frame_count += 1
-        if frame_count % 10 == 0:
-            current_time = time.time()
-            fps = 10 / (current_time - previous_time)
-            previous_time = current_time
-
-        # Run car detection
+        detected_plate_this_frame = False
         car_results = car_model.predict(frame)
-        detected_car = False
 
         for result in car_results:
             boxes = result.boxes.xyxy.cpu().numpy()
             confs = result.boxes.conf.cpu().numpy()
 
             for i, box in enumerate(boxes):
-                x1, y1, x2, y2 = map(int, box)
-                conf_score = confs[i]
-
-                if conf_score >= CONF_THRESHOLD:
-                    detected_car = True
+                if confs[i] >= CONF_THRESHOLD:
+                    x1, y1, x2, y2 = map(int, box)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                    cv2.putText(frame, f"Car ({conf_score:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-                    # Save detected car image
-                    img_filename = os.path.join(SAVE_FOLDER, f"car_detected_{serial_number:03d}.png")
-                    cv2.imwrite(img_filename, frame[y1:y2, x1:x2])
-
-                    # Run license plate detection
                     plate_results = plate_model.predict(frame)
-                    detected_plate = False
+                    for presult in plate_results:
+                        plate_boxes = presult.boxes.xyxy.cpu().numpy()
+                        plate_confs = presult.boxes.conf.cpu().numpy()
 
-                    for plate_result in plate_results:
-                        plate_boxes = plate_result.boxes.xyxy.cpu().numpy()
-                        plate_confs = plate_result.boxes.conf.cpu().numpy()
+                        for j, pbox in enumerate(plate_boxes):
+                            if plate_confs[j] >= CONF_THRESHOLD:
+                                px1, py1, px2, py2 = map(int, pbox)
+                                cropped = frame[py1:py2, px1:px2]
 
-                        for j, plate_box in enumerate(plate_boxes):
-                            px1, py1, px2, py2 = map(int, plate_box)
-                            plate_conf_score = plate_confs[j]
+                                plate_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                                preprocessed_img = preprocess_for_easyocr(cropped, plate_id)
 
-                            if plate_conf_score >= CONF_THRESHOLD:
-                                detected_plate = True
-                                license_text, plate_score = ocr_image(frame, plate_box)
+                                ocr_results = reader.readtext(preprocessed_img)
 
-                                # Draw bounding box
-                                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
-                                cv2.putText(frame, f"{license_text} ({plate_score:.2f})", (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                for res in ocr_results:
+                                    if isinstance(res[1], str):
+                                        raw = res[1].strip()
+                                        norm_plate = normalize_plate(raw)
+                                        score = res[2]
 
-                                # Save results to DataFrame
-                                df.loc[len(df)] = [car_id, serial_number, conf_score, license_text, plate_score, datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%H:%M:%S")]
+                                        if (
+                                            len(norm_plate) >= 6 and
+                                            score > PLATE_THRESHOLD and
+                                            validate_plate_format(norm_plate)
+                                        ):
+                                            now = datetime.now()
+                                            detected_plate_this_frame = True
 
-                    serial_number += 1
+                                            cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                                            cv2.putText(frame, f"{norm_plate} ({score:.2f})", (px1, py1 - 10),
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # Display FPS on the frame
-        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                                            if current_session["start_time"] is None:
+                                                current_session["start_time"] = now
+                                                current_session["plates"] = [(norm_plate, score)]
+                                            else:
+                                                current_session["plates"].append((norm_plate, score))
+                                            current_session["last_seen"] = time.time()
 
-        # Display live detection feed
+        # Cooldown check
+        if current_session["last_seen"] and not detected_plate_this_frame:
+            if time.time() - current_session["last_seen"] > COOLDOWN_SECONDS:
+                best_plate, best_score = max(current_session["plates"], key=lambda x: x[1])
+                in_time = current_session["start_time"]
+                out_time = datetime.now()
+                duration = out_time - in_time
+                duration_str = str(duration).split('.')[0]
+                parking_seconds = int(duration.total_seconds())
+                parking_fee = round(parking_seconds * PARKING_RATE_PER_SECOND, 2)
+                parking_fee_str = f"€{parking_fee:.2f}"
+
+                new_row = pd.DataFrame([[best_plate,
+                                         in_time.strftime("%Y-%m-%d %H:%M:%S"),
+                                         out_time.strftime("%Y-%m-%d %H:%M:%S"),
+                                         round(best_score, 3),
+                                         duration_str,
+                                         parking_fee_str]],
+                                       columns=df_columns)
+                log_df = pd.concat([log_df, new_row], ignore_index=True)
+                print(f"[CAR LOGGED] {best_plate} | Duration: {duration_str} | Fee: {parking_fee_str}")
+                current_session = {"start_time": None, "last_seen": None, "plates": []}
+
         cv2.imshow("Live ANPR", frame)
-
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 except KeyboardInterrupt:
-    print("Process interrupted. Saving detected data...")
-    save_log(df)
+    print("\n🛑 Interrupted — saving final log...")
 
 finally:
-    save_log(df)
-    
-    # Uncomment to enable filtering highest plate score for the highest car ID
-    filter_highest_plate_score()
-
     cap.release()
     cv2.destroyAllWindows()
+    log_df.to_excel(excel_path, index=False)
+    print(f"✅ Log saved at: {os.path.abspath(excel_path)}")
+
+
